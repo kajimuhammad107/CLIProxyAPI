@@ -1,0 +1,100 @@
+name: Deploy CLIProxyAPI to App1
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app1-cli-proxy-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      APP1_HOST: ${{ vars.APP1_HOST || '154.17.19.97' }}
+      APP1_PORT: ${{ vars.APP1_SSH_PORT || '29388' }}
+      IMAGE: cpa-stack-cli-proxy-api:ci-${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build App1 image
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform linux/amd64 \
+            --build-arg VERSION="${GITHUB_SHA:0:12}" \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag "${IMAGE}" \
+            .
+
+      - name: Prepare SSH
+        env:
+          APP1_SSH_PRIVATE_KEY: ${{ secrets.APP1_SSH_PRIVATE_KEY }}
+          APP1_SSH_KNOWN_HOSTS: ${{ secrets.APP1_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "${APP1_SSH_PRIVATE_KEY}"
+          test -n "${APP1_SSH_KNOWN_HOSTS}"
+          printf '%s\n' "${APP1_SSH_PRIVATE_KEY}" > "${RUNNER_TEMP}/app1_key"
+          printf '%s\n' "${APP1_SSH_KNOWN_HOSTS}" > "${RUNNER_TEMP}/app1_known_hosts"
+          chmod 600 "${RUNNER_TEMP}/app1_key" "${RUNNER_TEMP}/app1_known_hosts"
+
+      - name: Transfer image to App1
+        run: |
+          set -euo pipefail
+          docker save "${IMAGE}" | gzip -1 | ssh \
+            -i "${RUNNER_TEMP}/app1_key" \
+            -p "${APP1_PORT}" \
+            -o BatchMode=yes \
+            -o UserKnownHostsFile="${RUNNER_TEMP}/app1_known_hosts" \
+            root@"${APP1_HOST}" 'gunzip | docker load'
+
+      - name: Update only CLIProxyAPI with rollback
+        run: |
+          set -euo pipefail
+          ssh \
+            -i "${RUNNER_TEMP}/app1_key" \
+            -p "${APP1_PORT}" \
+            -o BatchMode=yes \
+            -o UserKnownHostsFile="${RUNNER_TEMP}/app1_known_hosts" \
+            root@"${APP1_HOST}" "IMAGE='${IMAGE}' bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+          cd /opt/cpa-stack
+          backup=".env.backup.cli-proxy.$(date -u +%Y%m%dT%H%M%SZ)"
+          cp -p .env "${backup}"
+          rollback() {
+            cp -p "${backup}" .env
+            docker compose up -d --no-deps cli-proxy-api >/dev/null 2>&1 || true
+          }
+          trap rollback ERR
+
+          tmp="$(mktemp .env.XXXXXX)"
+          grep -v '^CPA_IMAGE=' .env > "${tmp}" || true
+          printf 'CPA_IMAGE=%s\n' "${IMAGE}" >> "${tmp}"
+          chmod 600 "${tmp}"
+          mv "${tmp}" .env
+          docker compose up -d --no-deps cli-proxy-api
+
+          for attempt in $(seq 1 30); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' cpa-stack-cli-proxy-api 2>/dev/null || true)"
+            if [ "${status}" = healthy ]; then
+              trap - ERR
+              echo "CLIProxyAPI healthy"
+              docker compose ps cli-proxy-api
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs --tail 80 cli-proxy-api
+          exit 1
+          REMOTE
